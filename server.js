@@ -10,6 +10,36 @@ import {
 const app = express();
 app.disable('x-powered-by');
 
+// Cache in-memory sederhana untuk static asset (kurangi hit ke origin -> hindari 429).
+const assetCache = new Map(); // key -> { status, headers, body, expires }
+const ASSET_TTL_MS = 1000 * 60 * 10; // 10 menit
+const ASSET_CACHE_MAX = 500;
+
+function cacheableAssetPath(path) {
+  return /\.(css|js|mjs|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot|map|json|mp4|webm|avif)(\?|$)/i.test(
+    path
+  );
+}
+
+function getCache(key) {
+  const hit = assetCache.get(key);
+  if (!hit) return null;
+  if (Date.now() > hit.expires) {
+    assetCache.delete(key);
+    return null;
+  }
+  return hit;
+}
+
+function setCache(key, value) {
+  if (assetCache.size >= ASSET_CACHE_MAX) {
+    // Buang entri terlama.
+    const firstKey = assetCache.keys().next().value;
+    assetCache.delete(firstKey);
+  }
+  assetCache.set(key, { ...value, expires: Date.now() + ASSET_TTL_MS });
+}
+
 // Header response dari origin yang tidak boleh diteruskan apa adanya.
 const HOP_BY_HOP = new Set([
   'connection',
@@ -129,6 +159,32 @@ function rewriteHeaderValue(value, ctx) {
     .replaceAll(config.originHost, ctx.mirrorHost);
 }
 
+// Fetch ke origin dengan retry & backoff saat origin membatasi (429/503).
+async function fetchWithRetry(url, init, maxRetries = 3) {
+  let attempt = 0;
+  let lastRes;
+  while (attempt <= maxRetries) {
+    const res = await fetch(url, init);
+    if (res.status !== 429 && res.status !== 503) return res;
+    lastRes = res;
+    if (attempt === maxRetries) break;
+    // Hormati Retry-After bila ada, jika tidak pakai backoff eksponensial.
+    const retryAfter = Number(res.headers.get('retry-after'));
+    const waitMs =
+      Number.isFinite(retryAfter) && retryAfter > 0
+        ? Math.min(retryAfter * 1000, 5000)
+        : 300 * Math.pow(2, attempt);
+    try {
+      await res.arrayBuffer(); // bebaskan koneksi sebelum retry.
+    } catch {
+      /* ignore */
+    }
+    await new Promise((r) => setTimeout(r, waitMs));
+    attempt += 1;
+  }
+  return lastRes;
+}
+
 // Ambil teks dari origin (dipakai handler robots/sitemap).
 async function fetchOriginText(path, req, ctx) {
   const res = await fetch(`${originBase()}${path}`, {
@@ -185,17 +241,22 @@ app.use(async (req, res) => {
   const ctx = mirrorContext(req);
   const targetUrl = `${originBase()}${req.originalUrl}`;
 
+  // Layani static asset dari cache bila tersedia (kurangi beban ke origin).
+  const isCacheableAsset =
+    req.method === 'GET' && cacheableAssetPath(req.originalUrl);
+  if (isCacheableAsset) {
+    const cached = getCache(targetUrl);
+    if (cached) {
+      res.status(cached.status);
+      for (const [k, v] of Object.entries(cached.headers)) res.setHeader(k, v);
+      res.setHeader('x-mirror-cache', 'HIT');
+      res.end(cached.body);
+      return;
+    }
+  }
+
   try {
     const reqHeaders = buildOriginHeaders(req, ctx);
-    // Teruskan IP klien asli (banyak API rate-limit / log berbasis IP).
-    const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '')
-      .toString()
-      .split(',')[0]
-      .trim();
-    if (clientIp) {
-      reqHeaders['x-forwarded-for'] = clientIp;
-      reqHeaders['x-real-ip'] = clientIp;
-    }
 
     const init = {
       method: req.method,
@@ -209,20 +270,22 @@ app.use(async (req, res) => {
       if (chunks.length) init.body = Buffer.concat(chunks);
     }
 
-    const originRes = await fetch(targetUrl, init);
+    const originRes = await fetchWithRetry(targetUrl, init);
 
     // Salin header (kecuali hop-by-hop), rewrite Location/Link & Set-Cookie.
+    const outHeaders = {};
     originRes.headers.forEach((value, key) => {
       const k = key.toLowerCase();
       if (HOP_BY_HOP.has(k)) return;
       if (k === 'set-cookie') return; // ditangani khusus di bawah.
       if (config.forceIndexable && k === 'x-robots-tag') return; // buang noindex.
       if (k === 'location' || k === 'link') {
-        res.setHeader(key, rewriteHeaderValue(value, ctx));
+        outHeaders[key] = rewriteHeaderValue(value, ctx);
         return;
       }
-      res.setHeader(key, value);
+      outHeaders[key] = value;
     });
+    for (const [k, v] of Object.entries(outHeaders)) res.setHeader(k, v);
 
     // Set-Cookie: ambil semua cookie (jangan tergabung), rewrite domain agar sesi jalan.
     const setCookies =
@@ -239,19 +302,30 @@ app.use(async (req, res) => {
     res.status(originRes.status);
 
     const contentType = originRes.headers.get('content-type') || '';
+    let bodyBuf;
 
     if (isRewritableText(contentType)) {
       const text = await originRes.text();
       const body = isHtml(contentType)
         ? rewriteHtml(text, ctx)
         : rewriteText(text, ctx);
-      res.setHeader('content-length', Buffer.byteLength(body));
-      res.end(body);
+      bodyBuf = Buffer.from(body);
     } else {
-      const buf = Buffer.from(await originRes.arrayBuffer());
-      res.setHeader('content-length', buf.length);
-      res.end(buf);
+      bodyBuf = Buffer.from(await originRes.arrayBuffer());
     }
+
+    res.setHeader('content-length', bodyBuf.length);
+
+    // Simpan asset (teks ter-rewrite maupun biner) ke cache bila sukses & bukan HTML.
+    if (isCacheableAsset && originRes.status === 200 && !isHtml(contentType)) {
+      setCache(targetUrl, {
+        status: 200,
+        headers: { ...outHeaders, 'content-length': bodyBuf.length },
+        body: bodyBuf,
+      });
+    }
+
+    res.end(bodyBuf);
   } catch (err) {
     console.error(`[mirror] ${req.method} ${targetUrl} ->`, err.message);
     res.status(502).type('text/plain').send('Mirror upstream error.');
